@@ -63,6 +63,46 @@ class Aioredlock:
         if value <= 0:
             raise ValueError("Retry delay must be greater than 0 seconds.")
 
+    async def _set_lock(self, resource, identifier):
+
+        error = RuntimeError('Retry count less then one')
+        try:
+            # global try/except to catch CancelledError
+            for n in range(self.retry_count):
+                self.log.debug('Setting lock "%s" try %d/%d',
+                               resource, n + 1, self.retry_count)
+                if n != 0:
+                    delay = random.uniform(self.retry_delay_min,
+                                           self.retry_delay_max)
+                    await asyncio.sleep(delay)
+                try:
+                    elapsed_time = await self.redis.set_lock(resource, identifier)
+                except LockError as exc:
+                    error = exc
+                    continue
+
+                if self.lock_timeout - elapsed_time - self.drift <= 0:
+                    error = LockError('Lock timeout')
+                    self.log.debug('Timeout in setting the lock "%s"', resource)
+                    continue
+
+                error = None
+                break
+            else:
+                # break never reached
+                raise error
+
+        except Exception:
+            # cleanup in case of fault or cancellation will run in background
+            async def cleanup():
+                self.log.debug('Cleaning up lock "%s"', resource)
+                with contextlib.suppress(LockError):
+                    await self.redis.unset_lock(resource, identifier)
+
+            asyncio.ensure_future(cleanup())
+
+            raise
+
     @property
     def log(self):
         return logging.getLogger(__name__)
@@ -78,47 +118,9 @@ class Aioredlock:
         :return: :class:`aioredlock.Lock`
         :raises: LockError in case of fault
         """
+        self.log.debug('Setting lock "%s"', resource)
         lock_identifier = str(uuid.uuid4())
-        error = RuntimeError('Retry count less then one')
-
-        try:
-            # global try/except to catch CancelledError
-            for n in range(self.retry_count):
-                self.log.debug('Acquiring lock "%s" try %d/%d',
-                               resource, n + 1, self.retry_count)
-                if n != 0:
-                    delay = random.uniform(self.retry_delay_min,
-                                           self.retry_delay_max)
-                    await asyncio.sleep(delay)
-                try:
-                    elapsed_time = await self.redis.set_lock(resource, lock_identifier)
-                except LockError as exc:
-                    error = exc
-                    continue
-
-                if self.lock_timeout - elapsed_time - self.drift <= 0:
-                    error = LockError('Lock timeout')
-                    self.log.debug('Timeout in acquiring the lock "%s"',
-                                   resource)
-                    continue
-
-                error = None
-                break
-            else:
-                # break never reached
-                raise error
-
-        except Exception as exc:
-            # cleanup in case of fault or cancellation will run in background
-            async def cleanup():
-                self.log.debug('Cleaning up lock "%s"', resource)
-                with contextlib.suppress(LockError):
-                    await self.redis.unset_lock(resource, lock_identifier)
-
-            asyncio.ensure_future(cleanup())
-
-            raise
-
+        await self._set_lock(resource, lock_identifier)
         return Lock(self, resource, lock_identifier, valid=True)
 
     async def extend(self, lock):
@@ -136,7 +138,11 @@ class Aioredlock:
         if not lock.valid:
             raise RuntimeError('Lock is not valid')
 
-        await self.redis.set_lock(lock.resource, lock.id)
+        try:
+            await self._set_lock(lock.resource, lock.id)
+        except Exception:
+            lock.valid = False
+            raise
 
     async def unlock(self, lock):
         """
